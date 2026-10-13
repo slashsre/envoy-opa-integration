@@ -1,0 +1,83 @@
+#Configuraciones de ejemplo que se podrian manejar sobre la version 1.13.1 que se plantea usar de envoy
+#https://github.com/envoyproxy/envoy/tree/v1.13.1/configs
+admin:
+  access_log_path: "/dev/null"
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 8001
+# static_resource es el estracto usado para especificar la configuracion estatica de envoy para su boostrap. Envoy soporta tambien configuraciones dinamicas.
+static_resources:
+  listeners: # The beginning of the configuration defines the Listeners. A Listener is the networking configuration, such as IP address and ports, that Envoy listens to for requests
+    - address:
+        socket_address:
+          address: 0.0.0.0 # Proxy binding Ip
+          port_value: 8000 # Proxy binding port
+      #Posible configuracion para exposicion tls
+      #listener_filters:
+      #- name: "envoy.filters.listener.tls_inspector"
+      #  typed_config: {}
+      #  per_connection_buffer_limit_bytes: 32768 # 32 KiB
+      #  filter_chains:
+      #  - filter_chain_match:
+      #      server_names: ["example.com", "www.example.com"]
+      #    tls_context:
+      #      common_tls_context:
+      #        tls_certificates:
+      #        - certificate_chain: { filename: "example_com_cert.pem" }
+      #          private_key: { filename: "example_com_key.pem" }
+      filter_chains:
+        - filters:
+          #The filter is using envoy.http_connection_manager, a built-in filter designed for HTTP connections. The details are as follows:
+            #stat_prefix: The human-readable prefix to use when emitting statistics for the connection manager.
+            #route_config: The configuration for the route. If the virtual host matches, then the route is checked. In this example, the route_config matches all incoming HTTP requests, no matter the host domain requested.
+            #routes: If the URL prefix is matched then a set of route rules defines what should happen next. In this case "/" means match the root of the request
+            #host_rewrite: Change the inbound Host header for the HTTP request.
+            #cluster: The name of the cluster which will handle the request. The implementation is defined below.
+            #http_filters: The filter allows Envoy to adapt and modify the request as it is processed.
+            - name: envoy.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
+                codec_type: auto
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains:
+                        - "*"
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: service
+                http_filters:
+                  - name: envoy.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.filter.http.ext_authz.v2.ExtAuthz
+                      with_request_body:
+                        max_request_bytes: 8192
+                        allow_partial_message: true
+                      failure_mode_allow: false
+                      grpc_service:
+                        google_grpc:
+                          target_uri: opa.opa.svc.cluster.local:9191
+                          stat_prefix: ext_authz
+                        timeout: 0.5s
+                  - name: envoy.router
+                    typed_config: {}
+  clusters:
+    - name: service
+      connect_timeout: 0.25s
+      type: strict_dns
+      dns_lookup_family: V4_ONLY
+      lb_policy: round_robin
+      load_assignment:
+        cluster_name: service
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: 127.0.0.1
+                  port_value: 8080

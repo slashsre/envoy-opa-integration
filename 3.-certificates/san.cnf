@@ -1,0 +1,38 @@
+[ req ]
+default_bits        = 2048
+prompt              = no
+default_md          = sha256
+distinguished_name  = req_distinguished_name
+req_extensions      = req_ext
+x509_extensions     = v3_ca
+
+[ req_distinguished_name ]
+C                   = ES
+ST                  = Barcelona
+L                   = Barcelona
+O                   = opa-ms
+OU                  = Engineering
+CN                  = server
+
+[ req_ext ]
+subjectAltName      = @alt_names
+
+[ v3_ca ]
+subjectAltName      = @alt_names
+basicConstraints    = critical, CA:TRUE
+keyUsage            = critical, digitalSignature, keyEncipherment, keyCertSign
+extendedKeyUsage    = serverAuth, clientAuth
+
+[ alt_names ]
+DNS.1               = server
+DNS.2               = server.example.com
+DNS.3               = server.local
+DNS.4               = localhost
+DNS.5               = server.opa-ms.svc.cluster.local
+DNS.6               = server-app
+DNS.7               = server-app.opa-ms
+DNS.8               = server-app.opa-ms.svc.cluster.local
+DNS.9               = client-app
+DNS.10              = client-app.opa-ms
+DNS.11              = client-app.opa-ms.svc.cluster.local
+IP.1                = 127.0.0.1

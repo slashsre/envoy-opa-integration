@@ -1,0 +1,119 @@
+# -------------------------------------------------------------------
+# Envoy Proxy Configuration for OPA POC (Python microservices)
+# -------------------------------------------------------------------
+# Traffic flow:
+#   External → iptables (proxy_init) → Envoy :8443 → ext_authz (OPA :9191)
+#                                                   → upstream Python app :5000
+#
+# The ext_authz filter sends every request to OPA for policy evaluation
+# before forwarding to the backend Python service.
+# -------------------------------------------------------------------
+
+static_resources:
+  listeners:
+
+  # Listener HTTP (redirect to HTTPS)
+  - name: listener_http
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 8000 }
+    filter_chains:
+    - filters:
+      - name: envoy.http_connection_manager
+        config:
+          codec_type: auto
+          stat_prefix: ingress_http
+          route_config:
+            virtual_hosts:
+            - name: backend
+              domains:
+              - "*"
+              routes:
+              - match:
+                  prefix: "/"
+                redirect:
+                  path_redirect: "/"
+                  https_redirect: true
+          http_filters:
+          - name: envoy.ext_authz
+            typed_config:
+              "@type": type.googleapis.com/envoy.config.filter.http.ext_authz.v2.ExtAuthz
+              with_request_body:
+                max_request_bytes: 8192
+                allow_partial_message: true
+              failure_mode_allow: false
+              grpc_service:
+                google_grpc:
+                  target_uri: opa.opa.svc.cluster.local:9191
+                  stat_prefix: ext_authz
+                timeout: 0.5s
+          - name: envoy.router
+            config: {}
+
+  # Listener HTTPS (TLS termination + ext_authz → Python backend)
+  - name: listener_https
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 8443 }
+    filter_chains:
+    - filters:
+      - name: envoy.http_connection_manager
+        config:
+          codec_type: auto
+          stat_prefix: ingress_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: backend
+              domains:
+              - "*"
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: service
+          http_filters:
+          - name: envoy.ext_authz
+            typed_config:
+              "@type": type.googleapis.com/envoy.config.filter.http.ext_authz.v2.ExtAuthz
+              with_request_body:
+                max_request_bytes: 8192
+                allow_partial_message: true
+              failure_mode_allow: false
+              grpc_service:
+                google_grpc:
+                  target_uri: opa.opa.svc.cluster.local:9191
+                  stat_prefix: ext_authz
+                timeout: 0.5s
+          - name: envoy.router
+            config: {}
+      tls_context:
+        common_tls_context:
+          tls_certificates:
+            - certificate_chain:
+                filename: "/opt/certs/server.crt"
+              private_key:
+                filename: "/opt/certs/server.key"
+
+  clusters:
+    - name: service
+      connect_timeout: 0.25s
+      type: strict_dns
+      dns_lookup_family: V4_ONLY
+      lb_policy: round_robin
+      load_assignment:
+        cluster_name: service
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  # Python Flask app listening on localhost:5000 (HTTP, no TLS)
+                  # Envoy handles TLS termination externally
+                  address: 127.0.0.1
+                  port_value: 5000
+
+admin:
+  access_log_path: "/dev/null"
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 8001

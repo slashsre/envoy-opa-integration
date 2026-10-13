@@ -1,0 +1,144 @@
+# -------------------------------------------------------------------
+# Client App Deployment (client-service) + Envoy Sidecar + OPA
+# -------------------------------------------------------------------
+#
+# Architecture:
+#   ┌────────────────────────────────────────────────────┐
+#   │ Pod: client-app                                    │
+#   │                                                    │
+#   │  ┌──────────┐   initContainer: proxy-init          │
+#   │  │iptables  │   (redirects traffic through Envoy)  │
+#   │  └──────────┘                                      │
+#   │                                                    │
+#   │  ┌──────────────┐       ┌──────────────────┐       │
+#   │  │ Envoy :8443  │──────▶│ client.py :5000  │       │
+#   │  │ (TLS + authz)│       │ /api/client/v1   │       │
+#   │  └──────┬───────┘       └──────────────────┘       │
+#   │         │                                          │
+#   │         │ ext_authz (gRPC)                         │
+#   │         ▼                                          │
+#   │  OPA :9191 (opa.opa.svc.cluster.local)             │
+#   └────────────────────────────────────────────────────┘
+# -------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-app
+  namespace: opa-ms
+  labels:
+    app: client-app
+    version: 1.0.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client-app
+  template:
+    metadata:
+      labels:
+        app: client-app
+        version: 1.0.0
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        # -------------------------------------------------------------
+        # Sidecar: Envoy Proxy
+        # - Listens on :8443 (HTTPS) with ext_authz filter → OPA
+        # - Forwards allowed requests to localhost:5000 (Python app)
+        # - TLS terminated here using certs from server-tls-secret
+        # -------------------------------------------------------------
+        - name: envoy
+          image: envoyproxy/envoy:v1.13.0
+          securityContext:
+            runAsUser: 1111
+          ports:
+          - name: envoy-https
+            containerPort: 8443
+            protocol: TCP
+          - name: envoy-admin
+            containerPort: 8001
+            protocol: TCP
+          volumeMounts:
+          - readOnly: true
+            mountPath: /config
+            name: envoy-proxy-config
+          - readOnly: true
+            mountPath: /opt/certs
+            name: tls-certs
+          args:
+          - "envoy"
+          - "--config-path"
+          - "/config/envoy-python-apps.yaml"
+          - --component-log-level
+          - main:debug,config:debug,upstream:debug,connection:debug,http:debug
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+        # -------------------------------------------------------------
+        # Main Container: Python Client Service
+        # - Listens on :5000 (HTTP, no TLS — Envoy handles TLS)
+        # - Endpoint: /api/client/v1
+        # - Calls upstream server-app through Envoy
+        # -------------------------------------------------------------
+        - name: client-app
+          image: localhost:5000/client-app:1.0.0
+          imagePullPolicy: Always
+          ports:
+          - name: http
+            containerPort: 5000
+            protocol: TCP
+          env:
+          - name: SERVER_HOST
+            value: "0.0.0.0"
+          - name: SERVER_PORT
+            value: "5000"
+          - name: SSL
+            value: "false"
+          # Target URL pointing to the server-app service through Envoy
+          - name: TARGET_URL
+            value: "https://server-app.opa-ms.svc.cluster.local:8443/api/server/v1"
+          - name: INSECURE_SKIP_VERIFY
+            value: "true"
+          - name: REQUEST_TIMEOUT
+            value: "5"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        # Envoy configuration (ConfigMap created from envoy-python-apps.yaml)
+        - name: envoy-proxy-config
+          configMap:
+            name: envoy-proxy-config
+        # TLS certificates from 3.-certificates (mounted for Envoy TLS termination)
+        - name: tls-certs
+          secret:
+            secretName: server-tls-secret
+            items:
+            - key: tls.crt
+              path: server.crt
+            - key: tls.key
+              path: server.key
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      serviceAccount: api-sa
+      serviceAccountName: api-sa

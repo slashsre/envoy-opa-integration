@@ -1,0 +1,6 @@
+# -------------------------------------------------------------------
+# OPA Configuration for Envoy Ext-Authz POC
+# -------------------------------------------------------------------
+# Policies are managed dynamically via kube-mgmt ConfigMaps in the 'opa' namespace.
+decision_logs:
+  console: true
