@@ -1,0 +1,125 @@
+# -------------------------------------------------------------------
+# OPA Delivery (consumidor) — GitHub Actions
+#
+# Este repo NO contiene la lógica de despliegue de OPA: hace checkout del
+# repo delivery (opa-delivery-k8s) y ejecuta sus scripts/Makefile.
+#
+#   delivery_mode=gitops    -> PR en el repo delivery; Flux despliega al mergear
+#   delivery_mode=pipeline  -> push a la rama base del delivery + kubectl apply
+#
+# Configuración de este repo:
+#  - Variable OPA_DELIVERY_REPOSITORY : (opcional) owner/repo del delivery; default slashsre/opa-delivery-k8s
+#  - Secret   OPA_DELIVERY_TOKEN      : PAT / GitHub App token con contents:write y
+#                                       pull-requests:write sobre el repo delivery
+#  - Secret   KUBECONFIG_B64          : kubeconfig en base64 (solo modo pipeline)
+# -------------------------------------------------------------------
+name: opa-delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operación sobre data.authz
+        type: choice
+        default: add-endpoint
+        options: [validate-only, add-endpoint, remove-endpoint, add-caller, remove-caller, add-public-path, remove-public-path, apply-spec]
+      caller:
+        description: Valor del claim del JWT (ej. guest)
+        type: string
+        default: ""
+      endpoint_path:
+        description: Path o glob (ej. /api/server/v1)
+        type: string
+        default: ""
+      methods:
+        description: Métodos separados por coma (ej. GET,POST)
+        type: string
+        default: ""
+      description:
+        description: Descripción del caller (opcional)
+        type: string
+        default: ""
+      change_spec:
+        description: 'Solo apply-spec: JSON {"operations":[...]}'
+        type: string
+        default: ""
+      delivery_mode:
+        description: gitops = PR en el repo delivery | pipeline = push + kubectl
+        type: choice
+        default: gitops
+        options: [gitops, pipeline]
+      base_branch:
+        description: Rama del repo delivery
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opa-delivery
+  cancel-in-progress: false
+
+jobs:
+  delivery:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: opa-delivery
+    steps:
+      - name: Checkout delivery repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.OPA_DELIVERY_REPOSITORY || 'slashsre/opa-delivery-k8s' }}
+          ref: ${{ inputs.base_branch }}
+          token: ${{ secrets.OPA_DELIVERY_TOKEN }}
+          path: opa-delivery
+          fetch-depth: 0
+
+      - name: Apply change to data.authz
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CALLER: ${{ inputs.caller }}
+          ENDPOINT_PATH: ${{ inputs.endpoint_path }}
+          METHODS: ${{ inputs.methods }}
+          DESCRIPTION: ${{ inputs.description }}
+          CHANGE_SPEC: ${{ inputs.change_spec }}
+          CHANGE_SPEC_FILE: ${{ runner.temp }}/change-spec.json
+        run: |
+          if [ "$OPERATION" = "apply-spec" ]; then printf '%s' "$CHANGE_SPEC" > "$CHANGE_SPEC_FILE"; fi
+          scripts/apply-change.sh
+          git --no-pager diff -- policies
+
+      - name: Tests (CLI + policy gate)
+        run: make test
+
+      - name: Render manifests + bundle
+        run: make policy-render policy-bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opa-delivery-${{ github.run_id }}
+          path: opa-delivery/dist/
+
+      - name: Configure kubeconfig (pipeline mode)
+        if: inputs.delivery_mode == 'pipeline' && inputs.operation != 'validate-only'
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Publish (${{ inputs.delivery_mode }})
+        if: inputs.operation != 'validate-only'
+        env:
+          DELIVERY_MODE: ${{ inputs.delivery_mode }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          CHANGE_BRANCH: opa-delivery/${{ github.event.repository.name }}-${{ github.run_id }}
+          CHANGE_AUTHOR: ${{ github.actor }} desde ${{ github.repository }} (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          COMMIT_MESSAGE: "chore(opa): ${{ inputs.operation }} ${{ inputs.caller }} ${{ inputs.endpoint_path }}"
+          GH_TOKEN: ${{ secrets.OPA_DELIVERY_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/publish-change.sh

@@ -1,0 +1,127 @@
+// -------------------------------------------------------------------
+// OPA Delivery (consumidor) — Jenkins
+//
+// Este repo NO contiene la lógica de despliegue de OPA: el job hace
+// checkout del repo delivery (opa-delivery-k8s) y ejecuta sus scripts/Makefile.
+//
+// Job: "Pipeline script from SCM" sobre ESTE repo, Script Path: 8.-opa-delivery/Jenkinsfile
+// Agente: git, python3, make, curl, kubectl (modo pipeline), gh (opcional, PR automático).
+//
+// Credenciales:
+//   opa-delivery-git         usernamePassword: usuario + token con push sobre el repo delivery
+//                            (si el delivery está en GitHub, también se usa para `gh pr create`)
+//   opa-delivery-kubeconfig  secret file: kubeconfig del cluster (solo modo pipeline)
+// -------------------------------------------------------------------
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  parameters {
+    choice(name: 'OPERATION',
+           choices: ['validate-only', 'add-endpoint', 'remove-endpoint', 'add-caller', 'remove-caller',
+                     'add-public-path', 'remove-public-path', 'apply-spec'],
+           description: 'Operación sobre data.authz')
+    string(name: 'CALLER', defaultValue: '', description: 'Valor del claim del JWT (ej. guest)')
+    string(name: 'ENDPOINT_PATH', defaultValue: '', description: 'Path o glob (ej. /api/server/v1, /api/items/*)')
+    string(name: 'METHODS', defaultValue: '', description: 'Métodos separados por coma (ej. GET,POST). En remove-endpoint vacío = elimina el endpoint completo')
+    string(name: 'DESCRIPTION', defaultValue: '', description: 'Descripción del caller (opcional)')
+    text(name: 'CHANGE_SPEC', defaultValue: '', description: 'Solo apply-spec: JSON {"operations":[...]}')
+    choice(name: 'DELIVERY_MODE', choices: ['gitops', 'pipeline'],
+           description: 'gitops = PR en el repo delivery (Flux despliega al mergear) | pipeline = push + kubectl apply')
+    string(name: 'DELIVERY_REPO_URL', defaultValue: 'https://github.com/slashsre/opa-delivery-k8s.git',
+           description: 'URL del repo delivery')
+    string(name: 'BASE_BRANCH', defaultValue: 'main', description: 'Rama del repo delivery')
+  }
+
+  environment {
+    GIT_CREDENTIALS_ID        = 'opa-delivery-git'
+    KUBECONFIG_CREDENTIALS_ID = 'opa-delivery-kubeconfig'
+    DELIVERY_DIR              = 'opa-delivery'
+    CHANGE_SPEC_FILE          = "${WORKSPACE}/change-spec.json"
+  }
+
+  stages {
+    stage('Checkout delivery') {
+      steps {
+        dir(env.DELIVERY_DIR) {
+          git url: params.DELIVERY_REPO_URL, branch: params.BASE_BRANCH, credentialsId: env.GIT_CREDENTIALS_ID
+        }
+      }
+    }
+
+    stage('Apply change') {
+      when { expression { params.OPERATION != 'validate-only' } }
+      steps {
+        script {
+          if (params.OPERATION == 'apply-spec') {
+            writeFile file: 'change-spec.json', text: params.CHANGE_SPEC
+          }
+        }
+        dir(env.DELIVERY_DIR) {
+          sh 'scripts/apply-change.sh'
+          sh 'git --no-pager diff -- policies'
+        }
+      }
+    }
+
+    stage('Tests') {
+      steps {
+        dir(env.DELIVERY_DIR) {
+          sh 'make test'
+        }
+      }
+    }
+
+    stage('Render & bundle') {
+      steps {
+        dir(env.DELIVERY_DIR) {
+          sh 'make policy-render policy-bundle'
+          archiveArtifacts artifacts: 'dist/*', fingerprint: true
+          // Apertura futura: publicar dist/opa-bundle.tar.gz en Artifactory/ACR aquí.
+        }
+      }
+    }
+
+    stage('Publish') {
+      when { expression { params.OPERATION != 'validate-only' } }
+      steps {
+        script {
+          def creds = [usernamePassword(credentialsId: env.GIT_CREDENTIALS_ID,
+                                        usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]
+          if (params.DELIVERY_MODE == 'pipeline') {
+            creds << file(credentialsId: env.KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')
+          }
+          withCredentials(creds) {
+            wrap([$class: 'BuildUser']) {
+              dir(env.DELIVERY_DIR) {
+                sh '''
+                  set -eu
+                  # Helper de credenciales: el token no queda en la URL ni en .git/config en claro
+                  git config credential.helper '!f() { echo "username=${GIT_USER}"; echo "password=${GIT_TOKEN}"; }; f'
+                  export GH_TOKEN="${GIT_TOKEN}"
+                  export CHANGE_AUTHOR="${BUILD_USER:-jenkins} desde envoy-opa-integration (${BUILD_URL})"
+                  export COMMIT_MESSAGE="chore(opa): ${OPERATION} ${CALLER} ${ENDPOINT_PATH}"
+                  export CHANGE_BRANCH="opa-delivery/envoy-opa-jenkins-${BUILD_NUMBER}"
+                  scripts/publish-change.sh
+                '''
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      dir(env.DELIVERY_DIR) {
+        sh 'git config --unset credential.helper || true'
+      }
+    }
+  }
+}
